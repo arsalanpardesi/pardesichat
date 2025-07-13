@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: pardesichat
-Version: 1.0.1
+Version: 1.1.0
 Summary: A terminal-based chat application with mulitplayer games and an on-device AI assistant
 Author-email: Arsalan Pardesi <arsalanpardesi.ai@gmail.com>
 License: MIT License
@@ -25,7 +25,19 @@ Dynamic: license-file
 Welcome to Pardesi Chat, a project by Arsalan Pardesi.
 
 This is a feature-rich, terminal-based chat application built with Python. It allows users on the same local network to connect and chat in real-time. More than just a chat app, it's a multi-game platform and a powerful AI assistant, all running locally in your terminal. The application intelligently detects if a server is running on the network; the first user to launch automatically becomes the host.
+## What's New in Version 1.1.0 (July 12, 2025)
 
+This version introduces a major new feature and includes bug fixes for a better user experience!
+
+* **New Game Added: EconSim - The Lemonade Stand Showdown!**
+    * Start a game with `/start-econsim` and have your friends join in.
+    * All players run their own lemonade stand in a shared market.
+    * Make daily decisions on pricing, marketing, and inventory.
+    * The on-device AI acts as a dynamic market simulator and judge, determining sales results and introducing random economic events. It's a fun, collaborative way to learn basic economic principles!
+
+* **Bug Fixes & Improvements:**
+    * Improved stability for single-user error messages in game modes.
+ 
 **✨ Features**
 
 * Real-time LAN Chat: Instantly communicate with other users on your local network.
@@ -47,11 +59,24 @@ This application is packaged and available on PyPI. The recommended way to insta
     Install the Package
     Open your terminal and run the following command:
     pip install pardesichat
+    
+    For Windows OS, you may have to run the below - make sure you have python installed:
+    python -m pip install pardesichat
 
 Run the Application
 Once installed, you can start the chat from any terminal window by simply typing:
 
     pardesi-chat
+    
+    For Windows and MacOS, you may have to add the path environment variables
+    Run pip show pardesichat or python -m pip show pardesichat to see the installation path.
+    
+    For Windows OS: 
+    Copy the path, change the last folder from site-packages to Scripts ---> then press windows key and type env. In the system properties window open enviornment variables, find the variable named Path, click edit and add this as a new path.
+    
+    For Mac OS: 
+    The path will usually be /Users/yourusername/Library/Python/x.y/bin ---> replace yourusername with your user and x.y with the python version you have installed. Then type nano ~/.zshrc in your terminal and type the following:
+    export PATH="/Users/yourusername/Library/Python/x.y/bin" and then press Ctrl+O and Ctrl+X to exit and then load the file as source ~/.zshrc
 
 
 The first person to run the command on a network will become the server host. All subsequent users running the same command will join the chat. To exit, type exit and press Enter.

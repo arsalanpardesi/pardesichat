@@ -11,6 +11,7 @@ import ipaddress
 import time
 import random
 import os
+import json
 
 # --- Configuration ---
 PORT = 13344
@@ -122,8 +123,274 @@ fight_state = {
     'pending_challenge': {}
 }
 
+# --- EconSim Game Configuration & State ---
+ECONSIM_CONFIG = {
+    "title": "Lemonade Stand Showdown",
+    "starting_cash": 50.00,
+    "duration_days": 10,
+    "item_costs": {
+        "lemons": 0.20,
+        "sugar": 0.10,
+        "cups": 0.05
+    }
+}
+
+# This dictionary will hold the state of the active EconSim game
+econsim_state = {
+    'in_progress': False,
+    'phase': None,  # Can be 'LOBBY', 'DECISION', 'PROCESSING'
+    'host': "",
+    'players': {},  # e.g., {'Alice': {'cash': 50, 'inventory': {...}, 'decision': {...}}}
+    'current_day': 0,
+    'daily_scenario': "",
+    'past_scenarios': []
+}
+
 
 # --- Helper Functions ---
+
+# Econsim funtions start --->
+
+def reset_econsim_state():
+    """Resets the EconSim game state."""
+    global econsim_state
+    econsim_state = {
+        'in_progress': False, 'phase': None, 'host': "",
+        'players': {}, 'current_day': 0, 'daily_scenario': "",
+        'past_scenarios': []
+    }
+
+def start_econsim_game(host_username, clients):
+    """Starts the lobby for a new game of EconSim."""
+    global econsim_state
+    reset_econsim_state()
+    econsim_state.update({
+        'in_progress': True,
+        'phase': 'LOBBY',
+        'host': host_username,
+        'players': {
+            host_username: {
+                'cash': ECONSIM_CONFIG['starting_cash'],
+                'inventory': {'lemons': 0, 'sugar': 0, 'cups': 0},
+                'decision': None
+            }
+        }
+    })
+    start_message = f"\n--- {host_username} has started a game of {ECONSIM_CONFIG['title']}! ---\nType /join-game to play! The host can type /begin-game to start. Rules 1 lemonade=1 lemon + 1 sugar + 1 cup. Starting Cash is $50 with zero inventory. lemon cost $0.2, sugar cost $0.1 cup cost $0.05. You decide price and marketing spend"
+    broadcast(start_message.encode('utf-8'), None, clients)
+
+def begin_econsim_day(clients):
+    """Starts a new day by generating a unique scenario and asking for decisions."""
+    global econsim_state
+    if not econsim_state['players']:
+        broadcast("[GAME] No players are in the game. EconSim ended.".encode('utf-8'), None, clients)
+        reset_econsim_state()
+        return
+
+    econsim_state['current_day'] += 1
+    econsim_state['phase'] = 'DECISION'
+    
+    for player in econsim_state['players']:
+        econsim_state['players'][player]['decision'] = None
+
+    
+    try:
+        import ollama
+        
+        # Create a formatted string of past scenarios to include in the prompt
+        past_scenarios_list = "\n".join(f"- {s}" for s in econsim_state['past_scenarios'])
+        
+        scenario_prompt = f"""
+        Generate a new and different one-sentence market scenario for a lemonade stand game.
+        Do NOT repeat any of the following scenarios that have already been used:
+        {past_scenarios_list}
+
+        Please provide only one new scenario. Examples of new scenarios: a hot sunny day, a surprise rain shower, a storm, a local festival is happening nearby.
+        """
+        response = ollama.chat(model=MODEL_PATH, messages=[{'role': 'user', 'content': scenario_prompt}])
+        new_scenario = response['message']['content'].strip()
+        
+        # Update the state with the new scenario
+        econsim_state['daily_scenario'] = new_scenario
+        econsim_state['past_scenarios'].append(new_scenario)
+
+    except Exception as e:
+        # Fallback with a random element to ensure it's not always the same
+        fallback_scenarios = ["It's a normal, average day.", "The weather is perfectly mild.", "There's a gentle breeze in the air."]
+        econsim_state['daily_scenario'] = random.choice(fallback_scenarios)
+        print(f"[EconSim] AI scenario generation failed: {e}")
+
+    day_message = f"\n--- Day {econsim_state['current_day']}/{ECONSIM_CONFIG['duration_days']} ---"
+    scenario_message = f"Market Report: {econsim_state['daily_scenario']}"
+    decision_prompt = "Please submit your decisions with: /decision price=X marketing=Y buy_lemons=Z buy_sugar=A buy_cups=B"
+    
+    broadcast(f"{day_message}\n{scenario_message}\n{decision_prompt}".encode('utf-8'), None, clients)
+
+    
+def extract_json_from_string(text):
+    """
+    Finds and parses a JSON object from within a larger string of text.
+    Returns the parsed JSON object or None if it fails.
+    """
+    try:
+        # Find the first opening curly brace and the last closing curly brace
+        start_index = text.find('{')
+        end_index = text.rfind('}')
+        if start_index != -1 and end_index != -1 and end_index > start_index:
+            json_string = text[start_index:end_index+1]
+            return json.loads(json_string)
+    except (json.JSONDecodeError, IndexError):
+        # Handle cases where the extraction or parsing fails
+        return None
+    return None
+    
+    
+def adjudicate_day_results(clients):
+    """Processes all player decisions, uses a two-step AI process and JSON parsing."""
+    global econsim_state
+    
+    player_data_string = ""
+    player_names = list(econsim_state['players'].keys())
+    for name in player_names:
+        decision = econsim_state['players'][name].get('decision', {})
+        player_data_string += f"- Player '{name}' set price to ${decision.get('price', 2.5):.2f}, spent ${decision.get('marketing', 0):.2f} on marketing.\n"
+
+    prompt = f"""
+        You are the simulator for a Lemonade Stand game.
+        The market scenario for today is: "{econsim_state['daily_scenario']}"
+        Here are the decisions from all competing players:
+        {player_data_string}
+        Based on the market scenario and their decisions (price, marketing), determine how many cups of lemonade each player sold. A lower price and higher marketing generally lead to more sales, especially on a good day. Players are competing against each other.
+        Provide your response ONLY in the following JSON format. It is critical that the `player_name` values in the response list are EXACTLY these names: {player_names}.
+
+        {{
+          "analysis": "A brief, one-sentence explanation of the market results. Example: Alice's aggressive pricing stole most of the customers.",
+          "results": [
+            {{ "player_name": "PlayerName1", "cups_sold": CUPS_SOLD }},
+            {{ "player_name": "PlayerName2", "cups_sold": CUPS_SOLD }}
+          ]
+        }}
+        """
+    
+    parsed_results = None
+    try:
+        import ollama
+        import json
+        
+        # Step 1: Get the narrative response
+        narrative_response = ollama.chat(model=MODEL_PATH, messages=[{'role': 'user', 'content': prompt}])
+        narrative_text = narrative_response['message']['content']
+        
+        print("\n[DEBUG] Raw AI Narrative Response:")
+        print(narrative_text)
+
+        # Step 2: Use a second AI call to extract the data into a JSON format
+        extraction_prompt = f"""
+            Read the following text and extract the number of cups sold for each player. The player names are: {player_names}.
+            Respond ONLY with a valid JSON object in the specified format.
+
+            Text to analyze: "{narrative_text}"
+
+            JSON format:
+            {{
+              "analysis": "A brief summary of the narrative.",
+              "results": [
+                {{ "player_name": "PlayerName1", "cups_sold": CUPS_SOLD }},
+                {{ "player_name": "PlayerName2", "cups_sold": CUPS_SOLD }}
+              ]
+            }}
+            """
+        json_response = ollama.chat(model=MODEL_PATH, messages=[{'role': 'user', 'content': extraction_prompt}], format='json')
+        ai_json_string = json_response['message']['content']
+        
+        print("\n[DEBUG] Raw AI JSON Response:")
+        print(ai_json_string)
+
+        parsed_results = extract_json_from_string(ai_json_string)
+        if not parsed_results:
+            raise ValueError("Failed to extract valid JSON from AI response.")
+
+        # --- Check for multiple possible keys to handle AI typos ---
+        results_list = []
+        possible_keys = ['results', 'reresults', 'reults']
+        for key in possible_keys:
+            if key in parsed_results:
+                results_list = parsed_results[key]
+                break
+        
+        if not results_list:
+            raise ValueError("AI JSON response did not contain a recognized results key.")
+
+        ai_player_names = {item.get('player_name') for item in results_list}
+        if not set(player_names).issubset(ai_player_names):
+            raise ValueError("AI response did not contain all required player names.")
+
+    except Exception as e:
+        print(f"[EconSim] AI adjudication failed: {e}. Using fallback.")
+        parsed_results = {
+            "analysis": "AI simulation failed. Using random results.",
+            "results": [{"player_name": name, "cups_sold": random.randint(5, 25)} for name in player_names]
+        }
+
+    end_of_day_report = f"\n--- End of Day {econsim_state['current_day']} Report ---\n"
+    end_of_day_report += f"Market Analysis: {parsed_results.get('analysis', 'N/A')}\n\n"
+
+    # Parsing results from AI response
+    final_results_list = parsed_results.get('results') or parsed_results.get('reresults') or parsed_results.get('reults', [])
+    sales_results = {item.get('player_name'): item.get('cups_sold', 0) for item in final_results_list}
+
+    for name, player_data in econsim_state['players'].items():
+        decision = player_data.get('decision', {})
+        
+        lemons_cost = decision.get('buy_lemons', 0) * ECONSIM_CONFIG['item_costs']['lemons']
+        sugar_cost = decision.get('buy_sugar', 0) * ECONSIM_CONFIG['item_costs']['sugar']
+        cups_cost = decision.get('buy_cups', 0) * ECONSIM_CONFIG['item_costs']['cups']
+        marketing_cost = decision.get('marketing', 0)
+        total_cost = lemons_cost + sugar_cost + cups_cost + marketing_cost
+
+        player_data['cash'] -= total_cost
+        player_data['inventory']['lemons'] += decision.get('buy_lemons', 0)
+        player_data['inventory']['sugar'] += decision.get('buy_sugar', 0)
+        player_data['inventory']['cups'] += decision.get('buy_cups', 0)
+
+        cups_sold_ai = sales_results.get(name, 0)
+        
+        max_possible_sales = min(
+            player_data['inventory']['lemons'],
+            player_data['inventory']['sugar'],
+            player_data['inventory']['cups']
+        )
+        
+        actual_sales = min(int(cups_sold_ai), int(max_possible_sales))
+        
+        revenue = actual_sales * decision.get('price', 0)
+        profit = revenue - total_cost
+
+        player_data['inventory']['lemons'] -= actual_sales
+        player_data['inventory']['sugar'] -= actual_sales
+        player_data['inventory']['cups'] -= actual_sales
+        player_data['cash'] += revenue
+        
+        end_of_day_report += f"Player: {name}\n"
+        end_of_day_report += f"  - Sales: {actual_sales} cups @ ${decision.get('price', 0):.2f} each\n"
+        end_of_day_report += f"  - Revenue: ${revenue:.2f} | Costs: ${total_cost:.2f} | Daily Profit: ${profit:.2f}\n"
+        end_of_day_report += f"  - Final Cash: ${player_data['cash']:.2f}\n"
+        inventory_str = f"Lemons: {int(player_data['inventory']['lemons'])}, Sugar: {int(player_data['inventory']['sugar'])}, Cups: {int(player_data['inventory']['cups'])}"
+        end_of_day_report += f"  - Inventory: {inventory_str}\n\n"
+
+    broadcast(end_of_day_report.encode('utf-8'), None, clients)
+
+    if econsim_state['current_day'] >= ECONSIM_CONFIG['duration_days']:
+        winner = max(econsim_state['players'].items(), key=lambda p: p[1]['cash'])
+        winner_report = f"\n--- GAME OVER! The winner is {winner[0]} with a final cash balance of ${winner[1]['cash']:.2f}! ---\n"
+        broadcast(winner_report.encode('utf-8'), None, clients)
+        reset_econsim_state()
+    else:
+        begin_econsim_day(clients)
+
+    
+# Econsim functions end <-----
+
 
 def clear_screen():
     """Clears the terminal screen for different operating systems."""
@@ -275,6 +542,7 @@ Type a message to chat, or try a command:
 /hangman <word>
 /fight @<user>
 /ai <prompt>
+/start-econsim
 """
         connection.send(welcome_art.encode('utf-8'))
         broadcast(f"[SYSTEM] {username} has joined the chat.".encode('utf-8'), connection, clients)
@@ -283,6 +551,8 @@ Type a message to chat, or try a command:
             broadcast_game_state(clients, recipient_list=[connection])
         elif fight_state['in_progress']:
             broadcast_fight_state(clients, 'idle', 'idle', f"A fight is in progress! It is {fight_state['turn']}'s turn.", recipient_list=[connection])
+        elif econsim_state['in_progress'] and econsim_state['phase'] == 'LOBBY':
+            connection.send(f"[GAME] An EconSim game is waiting for players. Type /join-game to play!".encode('utf-8'))
 
         while True:
             full_message = connection.recv(2048).decode('utf-8')
@@ -291,41 +561,45 @@ Type a message to chat, or try a command:
                 message_content = full_message[full_message.find('>')+2:]
 
                 if message_content.startswith('/'):
-                    parts = message_content.split(' ', 2)
-                    command = parts[0].lower()
+                    # --- FIX: New, more robust command parsing logic ---
+                    command_parts = message_content.split(' ', 1)
+                    command = command_parts[0].lower()
+                    args_string = command_parts[1] if len(command_parts) > 1 else ""
+                    # --- END FIX ---
 
                     if command in ['/whisper', '/msg']:
-                        if len(parts) < 3:
+                        whisper_parts = args_string.split(' ', 1)
+                        if len(whisper_parts) < 2:
                             connection.send("[SYSTEM] Usage: /whisper @<username> <message>".encode('utf-8'))
                         else:
-                            recipient_name = parts[1][1:] if parts[1].startswith('@') else parts[1]
+                            recipient_name = whisper_parts[0][1:] if whisper_parts[0].startswith('@') else whisper_parts[0]
                             if recipient_name in clients:
-                                private_message = parts[2]
+                                private_message = whisper_parts[1]
                                 clients[recipient_name].send(f"[Private from {sender_username}]: {private_message}".encode('utf-8'))
                                 connection.send(f"[You whispered to {recipient_name}]: {private_message}".encode('utf-8'))
                             else:
                                 connection.send(f"[SYSTEM] Error: User '{recipient_name}' not found.".encode('utf-8'))
                     
                     elif command == '/hangman':
-                        if game_state['in_progress'] or fight_state['in_progress']:
+                        hangman_parts = args_string.split()
+                        if not hangman_parts or not hangman_parts[0].isalpha():
+                            connection.send(f"[GAME] Usage: /hangman <word_to_guess> (e.g., /hangman python)".encode('utf-8'))
+                        elif game_state['in_progress'] or fight_state['in_progress'] or econsim_state['in_progress']:
                             connection.send("[GAME] A game is already in progress!".encode('utf-8'))
-                        elif len(parts) < 2 or not parts[1].isalpha():
-                            connection.send(f"[GAME] Usage: /hangman <word_to_guess> (e.g., /hangman python)".encode('utf-8')) 
                         else:
-                            start_hangman_game(sender_username, parts[1], clients)
+                            start_hangman_game(sender_username, hangman_parts[0], clients)
                     
                     elif command == '/guess':
+                        guess_parts = args_string.split()
                         if not game_state['in_progress']:
-                            connection.send("[GAME] No hangman game is currently in progress.".encode('utf-8')) 
-                        elif len(parts) < 2 or len(parts[1]) != 1 or not parts[1].isalpha():
-                            connection.send(f"[GAME] Usage: /guess <single_letter>".encode('utf-8')) 
+                            connection.send("[GAME] No hangman game is currently in progress.".encode('utf-8'))
+                        elif not guess_parts or len(guess_parts[0]) != 1 or not guess_parts[0].isalpha():
+                            connection.send(f"[GAME] Usage: /guess <single_letter>".encode('utf-8'))
                         else:
-                            
-                            guess = parts[1].upper()
+                            guess = guess_parts[0].upper()
                             if guess in game_state['guessed_letters']:
                                 broadcast(f"[GAME] '{guess}' has already been guessed.".encode('utf-8'), None, clients)
                             else:
-                                
                                 game_state['guessed_letters'].add(guess)
                                 if guess in game_state['word']:
                                     for i, letter in enumerate(game_state['word']):
@@ -352,17 +626,18 @@ Type a message to chat, or try a command:
                             broadcast(f"[GAME] {game_state['challenger']} has ended the game. The word was {game_state['word']}".encode('utf-8'), None, clients)
                             reset_game_state()
                         else:
-                            connection.send("[GAME] There is no hangman game to quit or you didn't start it.".encode('utf-8')) 
+                            connection.send("[GAME] There is no hangman game to quit or you didn't start it.".encode('utf-8'))
 
                     elif command == '/fight':
-                        if game_state['in_progress'] or fight_state['in_progress']:
-                            connection.send("[GAME] A game is already in progress!".encode('utf-8')) 
-                        elif len(parts) < 2 or not parts[1].startswith('@'):
-                            connection.send("[GAME] Usage: /fight @<username>".encode('utf-8')) 
+                        fight_parts = args_string.split()
+                        if not fight_parts or not fight_parts[0].startswith('@'):
+                            connection.send("[GAME] Usage: /fight @<username>".encode('utf-8'))
+                        elif game_state['in_progress'] or fight_state['in_progress'] or econsim_state['in_progress']:
+                            connection.send("[GAME] A game is already in progress!".encode('utf-8'))
                         else:
-                            opponent_name = parts[1][1:]
+                            opponent_name = fight_parts[0][1:]
                             if opponent_name == sender_username:
-                                connection.send("[GAME] You can't fight yourself!".encode('utf-8')) 
+                                connection.send("[GAME] You can't fight yourself!".encode('utf-8'))
                             else:
                                 fight_state['pending_challenge'] = {'challenger': sender_username, 'opponent': opponent_name}
                                 challenge_msg = f"[GAME] {sender_username} has challenged {opponent_name} to a fight! {opponent_name}, type /accept to fight."
@@ -372,15 +647,14 @@ Type a message to chat, or try a command:
                         if fight_state.get('pending_challenge', {}).get('opponent') == sender_username:
                             start_fight_game(clients)
                         else:
-                            connection.send("[GAME] You have not been challenged to a fight.".encode('utf-8')) 
+                            connection.send("[GAME] You have not been challenged to a fight.".encode('utf-8'))
 
                     elif command in ['/punch', '/kick', '/block', '/special']:
                         if not fight_state['in_progress']:
-                            connection.send("[GAME] No fight is in progress.".encode('utf-8')) 
+                            connection.send("[GAME] No fight is in progress.".encode('utf-8'))
                         elif sender_username != fight_state['turn']:
-                            connection.send(f"[GAME] It's not your turn! It's {fight_state['turn']}'s turn.".encode('utf-8')) 
+                            connection.send(f"[GAME] It's not your turn! It's {fight_state['turn']}'s turn.".encode('utf-8'))
                         else:
-                            
                             player1_name = sender_username
                             player2_name = fight_state['player_names'][1] if fight_state['player_names'][0] == player1_name else fight_state['player_names'][0]
                             action_text, p1_pose, p2_pose = "", 'idle', 'idle'
@@ -431,89 +705,101 @@ Type a message to chat, or try a command:
                                     p1_pose, p2_pose = p2_pose, p1_pose
                                 broadcast_fight_state(clients, p1_pose, p2_pose, f"{action_text}\n{next_turn_text}")
                     
-                   # AI logic start --->
-
                     elif command == '/ai':
-                        try:
-                            import ollama
-                            import requests
-                            from PIL import Image
-                            import io
-                            from newspaper import Article
+                        if not args_string:
+                            connection.send("[SYSTEM] Usage: /ai <prompt> or /ai <url> <prompt>".encode('utf-8'))
+                        else:
+                            try:
+                                import ollama
+                                import requests
+                                from newspaper import Article
+                                
+                                ai_parts = args_string.split(' ', 1)
+                                first_arg = ai_parts[0]
+                                question = ai_parts[1] if len(ai_parts) > 1 else ""
 
-                            if len(parts) < 2:
-                                connection.send("[SYSTEM] Usage: /ai <prompt> or /ai <url> <prompt>".encode('utf-8'))
-                                return
+                                if first_arg.startswith('http') and first_arg.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                                    image_url = first_arg
+                                    question = question or "Describe this image in detail."
+                                    ai_thinking_msg = f"[AI Bot is analyzing the image with {VISION_PATH}...]"
+                                    broadcast(ai_thinking_msg.encode('utf-8'), None, clients)
+                                    response = requests.get(image_url)
+                                    response.raise_for_status()
+                                    ollama_response = ollama.chat(model=VISION_PATH, messages=[{'role': 'user', 'content': question, 'images': [response.content]}])
+                                    response_text = ollama_response['message']['content']
+                                elif first_arg.startswith('http'):
+                                    article_url = first_arg
+                                    question = question or "Summarize the key points of this article."
+                                    ai_thinking_msg = f"[AI Bot is reading the article with {MODEL_PATH}...]"
+                                    broadcast(ai_thinking_msg.encode('utf-8'), None, clients)
+                                    article = Article(article_url)
+                                    article.download()
+                                    article.parse()
+                                    full_prompt = f"Based on the following article text, please answer this question: '{question}'\n\n--- ARTICLE TEXT ---\n{article.text}"
+                                    ollama_response = ollama.chat(model=MODEL_PATH, messages=[{'role': 'user', 'content': full_prompt}])
+                                    response_text = ollama_response['message']['content']
+                                else:
+                                    question = args_string
+                                    ai_thinking_msg = f"[AI Bot is thinking with {MODEL_PATH}...]"
+                                    broadcast(ai_thinking_msg.encode('utf-8'), None, clients)
+                                    ollama_response = ollama.chat(model=MODEL_PATH, messages=[{'role': 'user', 'content': question}])
+                                    response_text = ollama_response['message']['content']
+                                
+                                ai_response_msg = f"[🤖 AI Bot]: {response_text}"
+                                broadcast(ai_response_msg.encode('utf-8'), None, clients)
+                            except ImportError:
+                                broadcast("[AI] Required libraries for AI are not installed on the server.".encode('utf-8'), None, clients)
+                            except Exception as e:
+                                broadcast(f"[AI] An error occurred: {e}".encode('utf-8'), None, clients)
 
-                            first_arg = parts[1]
+                    elif command == '/start-econsim':
+                        if econsim_state['in_progress'] or game_state['in_progress'] or fight_state['in_progress']:
+                            connection.send("[GAME] Another game is already in progress.".encode('utf-8'))
+                        else:
+                            start_econsim_game(sender_username, clients)
 
-                            # LOGIC BRANCH 1: Handle Image URLs 
-                            if first_arg.startswith('http') and first_arg.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                                image_url = first_arg
-                                question = " ".join(parts[2:]) if len(parts) > 2 else "Describe this image in detail."
+                    elif command == '/join-game':
+                        if not econsim_state['in_progress'] or econsim_state['phase'] != 'LOBBY':
+                            connection.send("[GAME] There is no game to join right now.".encode('utf-8'))
+                        elif sender_username in econsim_state['players']:
+                            connection.send("[GAME] You are already in the game.".encode('utf-8'))
+                        else:
+                            econsim_state['players'][sender_username] = {
+                                'cash': ECONSIM_CONFIG['starting_cash'], 'inventory': {'lemons': 0, 'sugar': 0, 'cups': 0}, 'decision': None
+                            }
+                            broadcast(f"[GAME] {sender_username} has joined the EconSim game!".encode('utf-8'), None, clients)
 
-                                ai_thinking_msg = f"[AI Bot is analyzing the image and thinking about: \"{question}\"]"
-                                broadcast(ai_thinking_msg.encode('utf-8'), None, clients)
+                    elif command == '/begin-game':
+                        if not econsim_state['in_progress'] or econsim_state['phase'] != 'LOBBY':
+                            connection.send("[GAME] There is no game lobby to begin.".encode('utf-8'))
+                        elif sender_username != econsim_state['host']:
+                            connection.send("[GAME] Only the host can begin the game.".encode('utf-8'))
+                        else:
+                            broadcast(f"[GAME] The host has closed the lobby. The game begins!".encode('utf-8'), None, clients)
+                            begin_econsim_day(clients)
 
-                                response = requests.get(image_url, stream=True)
-                                response.raise_for_status()
-                                image_bytes = response.content
-
-                                ollama_response = ollama.chat(
-                                    model=VISION_PATH,
-                                    messages=[{
-                                        'role': 'user',
-                                        'content': question,
-                                        'images': [image_bytes]
-                                    }]
-                                )
-                                response_text = ollama_response['message']['content']
-
-                            # LOGIC BRANCH 2: Handle Article/Web Page URLs
-                            elif first_arg.startswith('http'):
-                                article_url = first_arg
-                                question = " ".join(parts[2:]) if len(parts) > 2 else "Summarize the key points of this article."
-
-                                ai_thinking_msg = f"[AI Bot is reading the article and thinking about: \"{question}\"]"
-                                broadcast(ai_thinking_msg.encode('utf-8'), None, clients)
-
-                                # Use newspaper3k to download and parse the article
-                                article = Article(article_url)
-                                article.download()
-                                article.parse()
-                                article_text = article.text
-
-                                # Create a prompt that includes the article content
-                                full_prompt = f"Based on the following article text, please answer this question: '{question}'\n\n--- ARTICLE TEXT ---\n{article_text}"
-
-                                ollama_response = ollama.chat(
-                                    model=MODEL_PATH,
-                                    messages=[{'role': 'user', 'content': full_prompt}]
-                                )
-                                response_text = ollama_response['message']['content']
-
-                            # LOGIC BRANCH 3: Handle Plain Text Questions 
-                            else:
-                                question = message_content[len(command)+1:]
-                                ai_thinking_msg = f"[AI Bot is thinking about: \"{question}\"]"
-                                broadcast(ai_thinking_msg.encode('utf-8'), None, clients)
-
-                                ollama_response = ollama.chat(
-                                    model=MODEL_PATH,
-                                    messages=[{'role': 'user', 'content': question}]
-                                )
-                                response_text = ollama_response['message']['content']
-
-                            ai_response_msg = f"[🤖 AI Bot]: {response_text}"
-                            broadcast(ai_response_msg.encode('utf-8'), None, clients)
-
-                        except ImportError:
-                            broadcast("[AI] Required libraries for AI are not installed on the server.".encode('utf-8'), None, clients)
-                        except Exception as e:
-                            broadcast(f"[AI] Error contacting Ollama service. Is it running? Error: {e}".encode('utf-8'), None, clients)
-                
-                # AI logic end <----  
-
+                    elif command == '/decision':
+                        if not econsim_state['in_progress'] or econsim_state['phase'] != 'DECISION':
+                            connection.send("[GAME] It is not time to make a decision.".encode('utf-8'))
+                        elif sender_username not in econsim_state['players']:
+                             connection.send("[GAME] You are not in the current EconSim game.".encode('utf-8'))
+                        elif econsim_state['players'][sender_username]['decision'] is not None:
+                            connection.send("[GAME] You have already submitted your decision for this day.".encode('utf-8'))
+                        else:
+                            try:
+                                # --- Parsing decision key=value pairs ---
+                                decision_parts = args_string.split()
+                                decision_data = {item.split('=')[0].lower(): float(item.split('=')[1]) for item in decision_parts}
+                                econsim_state['players'][sender_username]['decision'] = decision_data
+                                connection.send(f"[GAME] Your decision for Day {econsim_state['current_day']} has been locked in.".encode('utf-8'))
+                                
+                                all_decisions_in = all(p['decision'] is not None for p in econsim_state['players'].values())
+                                if all_decisions_in:
+                                    econsim_state['phase'] = 'PROCESSING'
+                                    broadcast("\n[GAME] All decisions are in! Simulating the day's results...".encode('utf-8'), None, clients)
+                                    adjudicate_day_results(clients)
+                            except (ValueError, IndexError):
+                                connection.send("[GAME] Invalid decision format. Use: /decision price=2.5 marketing=10 ...".encode('utf-8'))
                 else:
                     broadcast(full_message.encode('utf-8'), connection, clients)
             else:
@@ -521,7 +807,6 @@ Type a message to chat, or try a command:
     except Exception as e:
         print(f"[SERVER] Error in handle_client for {username}: {e}")
     finally:
-        
         if username and username in clients:
             del clients[username]
             broadcast(f"[SYSTEM] {username} has left the chat.".encode('utf-8'), None, clients)
@@ -531,8 +816,11 @@ Type a message to chat, or try a command:
             if fight_state['in_progress'] and username in fight_state['player_names']:
                  broadcast(f"[GAME] {username} disconnected. The fight is over.".encode('utf-8'), None, clients)
                  reset_fight_state()
+            if econsim_state['in_progress'] and username in econsim_state['players']:
+                del econsim_state['players'][username]
+                broadcast(f"[GAME] {username} has left the EconSim game.".encode('utf-8'), None, clients)
         connection.close()
-
+        
 
 def broadcast(message, sender_connection, clients):
     """Broadcasts a message to all clients in the dictionary."""

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pardesichat"
-version = "1.0.1"
+version = "1.1.0"
 authors = [{name="Arsalan Pardesi", email="arsalanpardesi.ai@gmail.com"},]
 description = "A terminal-based chat application with mulitplayer games and an on-device AI assistant"
 readme = "README.md"

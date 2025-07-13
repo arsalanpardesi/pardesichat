@@ -3,7 +3,19 @@
 Welcome to Pardesi Chat, a project by Arsalan Pardesi.
 
 This is a feature-rich, terminal-based chat application built with Python. It allows users on the same local network to connect and chat in real-time. More than just a chat app, it's a multi-game platform and a powerful AI assistant, all running locally in your terminal. The application intelligently detects if a server is running on the network; the first user to launch automatically becomes the host.
+## What's New in Version 1.1.0 (July 12, 2025)
 
+This version introduces a major new feature and includes bug fixes for a better user experience!
+
+* **New Game Added: EconSim - The Lemonade Stand Showdown!**
+    * Start a game with `/start-econsim` and have your friends join in.
+    * All players run their own lemonade stand in a shared market.
+    * Make daily decisions on pricing, marketing, and inventory.
+    * The on-device AI acts as a dynamic market simulator and judge, determining sales results and introducing random economic events. It's a fun, collaborative way to learn basic economic principles!
+
+* **Bug Fixes & Improvements:**
+    * Improved stability for single-user error messages in game modes.
+ 
 **✨ Features**
 
 * Real-time LAN Chat: Instantly communicate with other users on your local network.
